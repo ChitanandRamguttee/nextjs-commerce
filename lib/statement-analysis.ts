@@ -10,6 +10,8 @@ export type ClassifiedTransaction = StatementTransaction & {
   bucket: "asset" | "liability" | "income" | "expense";
 };
 
+export const MAX_STATEMENT_ROWS = 5_000;
+
 const CATEGORY_RULES: Array<{
   match: RegExp;
   category: string;
@@ -72,31 +74,117 @@ const CATEGORY_RULES: Array<{
   },
 ];
 
-export function parseCsvStatement(input: string): StatementTransaction[] {
-  const lines = input
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+function parseCsvRows(input: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let insideQuotes = false;
 
-  if (lines.length <= 1) {
+  const finishRow = () => {
+    row.push(field);
+    if (row.some((value) => value.trim() !== "")) {
+      rows.push(row);
+      if (rows.length > MAX_STATEMENT_ROWS + 1) {
+        throw new RangeError(
+          `A statement can contain at most ${MAX_STATEMENT_ROWS} transactions.`,
+        );
+      }
+    }
+    row = [];
+    field = "";
+  };
+
+  for (let index = 0; index < input.length; index += 1) {
+    const character = input.charAt(index);
+
+    if (character === '"') {
+      if (insideQuotes && input.charAt(index + 1) === '"') {
+        field += '"';
+        index += 1;
+      } else if (insideQuotes) {
+        insideQuotes = false;
+      } else if (field.trim() === "") {
+        field = "";
+        insideQuotes = true;
+      } else {
+        throw new SyntaxError("Invalid CSV quoting.");
+      }
+      continue;
+    }
+
+    if (!insideQuotes && character === ",") {
+      row.push(field);
+      field = "";
+      continue;
+    }
+
+    if (!insideQuotes && (character === "\n" || character === "\r")) {
+      if (character === "\r" && input.charAt(index + 1) === "\n") {
+        index += 1;
+      }
+      finishRow();
+      continue;
+    }
+
+    field += character;
+  }
+
+  if (insideQuotes) {
+    throw new SyntaxError("Invalid CSV quoting.");
+  }
+
+  if (field.length > 0 || row.length > 0) {
+    finishRow();
+  }
+
+  return rows;
+}
+
+function parseAmount(value: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const parenthesizedNegative = /^\(.*\)$/.test(trimmed);
+  const normalized = trimmed.replace(/,/g, "").replace(/[^\d.+-]/g, "");
+  if (!/^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$/.test(normalized)) {
+    return null;
+  }
+
+  const amount = Number(normalized);
+  if (!Number.isFinite(amount)) {
+    return null;
+  }
+
+  return parenthesizedNegative ? -Math.abs(amount) : amount;
+}
+
+export function parseCsvStatement(input: string): StatementTransaction[] {
+  const rows = parseCsvRows(input);
+  if (rows.length <= 1) {
     return [];
   }
 
-  const rows = lines.slice(1);
+  const transactions: StatementTransaction[] = [];
+  for (const cells of rows.slice(1)) {
+    const date = cells[0]?.trim();
+    const description = cells[1]?.trim();
+    const amountText = cells[2];
 
-  return rows
-    .map((row) => row.split(",").map((cell) => cell.trim()))
-    .filter((cells) => cells.length >= 3)
-    .map((cells) => {
-      const [date, description, amountText] = cells;
-      const amount = Number.parseFloat(amountText.replace(/[^0-9.-]/g, ""));
+    if (!date || !description || amountText === undefined) {
+      continue;
+    }
 
-      return {
-        date,
-        description,
-        amount: Number.isFinite(amount) ? amount : 0,
-      };
-    });
+    const amount = parseAmount(amountText);
+    if (amount === null) {
+      continue;
+    }
+
+    transactions.push({ date, description, amount });
+  }
+
+  return transactions;
 }
 
 export function classifyTransactions(
